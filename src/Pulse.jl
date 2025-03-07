@@ -1,6 +1,29 @@
+"""
+Pulse Module: Functions to generate and manipulate optical pulses\n
+Updated: 6 Mar 2025\n
+
+This module provides functions to generate various optical pulse shapes, including constant,
+step, Gaussian, hyperbolic secant, random pulses, and complex random pulses. In addition,
+it offers tools for simulating pulse dispersion under both second-order and full dispersion,
+in the time and Fourier domains. It also includes routines for generating simulton solutions,
+which are important in nonlinear optical processes.
+
+Exported Functions and Structures:
+  - Pulse shape functions: ff_const, ff_step, ff_gauss, ff_sech1, ff_sech, ff_rand, ff_gauss_rand, ff_rand_complex
+        --> Typical form: ff_gauss(t, A, σ)
+  - Pulse shape dictionary: pulse_func
+  - Utility function: heaviside
+  - Pulse parameter structure: pars_pulse
+  - Pulse dispersion functions: pulse_disp, pulse_disp_FT, pulse_disp_FT_fd
+  - Pulse generation: gen_pulse
+  - Simulton parameters and pulses: simulton_pars, simulton_pulse, simulton_pulse_2
+"""
 module Pulse
-using Random
-export ff_const, ff_ste, ff_gauss, ff_sech1, ff_sech, ff_rand, ff_gauss_rand, heaviside, gen_pulse
+
+using Random, Distributions
+using Materials
+export ff_const, ff_ste, ff_gauss, ff_sech1, ff_sech, ff_rand, ff_gauss_rand, ff_rand_complex
+export heaviside, gen_pulse, pulse_func
 
 ff_const(t, A, σ) = A
 ff_step(t, A, σ) = A * (heaviside(σ/2 + t) + heaviside(σ/2 - t) - 1)
@@ -10,22 +33,128 @@ ff_sech(t, A, τ) = A * sech(t/τ)^2
 ff_rand(t, A, σ) = A * (2 * rand() - 1)
 ff_gauss_rand(t, A, σ) = A /(σ*sqrt(2*pi)) *exp(-1/2*(t/σ)^2) * (2 * rand() - 1)
 
+function ff_rand_complex(t, A, σ)
+    dist = Normal(0, A)
+    return complex(rand(dist), rand(dist))
+end
+
+# Pulse dictionary
+pulse_func = Dict("const" => ff_const, "rand" => ff_rand, "rand_complex" => ff_rand_complex,
+    "gauss" => ff_gauss, "gauss_rand" => ff_gauss_rand, 
+    "sech" => ff_sech, "sech1" => ff_sech1);
+
 function heaviside(t)
    0.5 * (sign(t) + 1)
 end;
 
-# To prepare the initial condition
+export pars_pulse
+"""
+pars_pulse\n
+Class for optical pulse\n
+
+amp_max, T_pulse, N_div, f_pulse\n
+amp_max: (N_pulse, )\n
+omg_ctr: (N_pulse, )\n
+T_pulse: (N_pulse, )\n
+N_div: float\n
+    Number of sampled points: 2^n
+f_pulse: function OR Vector of functions\n
+    The function defining the pulse shape
+"""
+mutable struct pars_pulse
+    amp_max
+    omg_ctr
+    T_pulse
+    N_div::Integer
+    f_pulse
+    pars_pulse() = new()
+end
+
+export pulse_disp, pulse_disp_FT, pulse_disp_FT_fd
+"""
+pulse_disp(T, z, A, σ, β0, β1, β2)
+pulse under second order dispersion
+"""
+function pulse_disp(T, z, A, σ, β0, β1, β2)
+    γp = exp(1im*β0*z)/sqrt(2*pi*(σ^2-1im*β2*z))
+    fp = exp(-(T-β1*z)^2/(2*(σ^2-1im*β2*z)))
+    return A * γp * fp
+end;
+
+"""
+pulse_disp(T, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer)
+pulse under second order dispersion
+"""
+function pulse_disp(T, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0)
+    A = pulse.amp_max[id_pulse]
+    σ = pulse.T_pulse[id_pulse]
+    β0 = mat.beta_array[1,id_pulse]
+    if pulse_ref == 0
+        β1 = mat.beta_array[2,id_pulse]
+    else
+        β1 = mat.beta_array[2,id_pulse] - mat.beta_array[2,pulse_ref]
+    end
+    
+    β2 = mat.beta_array[3,id_pulse]
+    γp = exp(-1im*β0*z)/sqrt(2*pi*(σ^2+1im*β2*z))
+    fp = exp(-(T-β1*z)^2/(2*(σ^2+1im*β2*z)))
+    return A * γp * fp
+end;
+
+"""
+pulse_disp_FT(ω, z, A, σ, β0, β1, β2)
+pulse Fourier component under second order dispersion
+"""
+function pulse_disp_FT(ω, z, A, σ, β0, β1, β2)
+    out = A/sqrt(2*pi) * exp(-1im*z*(β0 + β1*ω + 0.5*β2*ω^2)) * exp(-(σ*ω)^2/2)
+    return out
+end;
+
+function pulse_disp_FT(ω, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0)
+    A = pulse.amp_max[id_pulse]
+    σ = pulse.T_pulse[id_pulse]
+    β0 = mat.beta_array[1,id_pulse]
+    if pulse_ref == 0
+        β1 = mat.beta_array[2,id_pulse]
+    else
+        β1 = mat.beta_array[2,id_pulse] - mat.beta_array[2,pulse_ref]
+    end
+    
+    β2 = mat.beta_array[3,id_pulse]
+    out = A/sqrt(2*pi) * exp(-1im*z*(β0 + β1*ω + 0.5*β2*ω^2)) * exp(-(σ*ω)^2/2)
+    return out
+end;
+
+"""
+pulse_disp_FT_fd(ω, z, A, σ,  ωctr::Float64, Avec::Vector{Float64}, Bvec::Vector{Float64}; beta_f = beta_sellmeier)
+pulse Fourier component under full dispersion
+"""
+function pulse_disp_FT_fd(ω, z, pulse::pars_pulse, mat::Material, id_pulse::Integer; pulse_ref = 0)
+    A = pulse.amp_max[id_pulse]
+    σ = pulse.T_pulse[id_pulse]
+    ωctr = pulse.omg_ctr[id_pulse]
+    if pulse_ref == 0
+        beta = beta_func(mat, ω + ωctr)
+    else
+        beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref])
+        beta = beta_func(mat, ω + ωctr) - beta_1_ref * ω 
+    end        
+    out = A/sqrt(2*pi) * exp(-1im*z*beta) * exp(-(σ*ω)^2/2)
+    return out
+end;
+
 """
 gen_pulse(amp_max, arr_time, Tpulse; ff = ff_sech)
 
 Generation of pulses\n
+To prepare the initial condition\n
 Inputs:\n
 
 Outputs:\n
 
 """
-function gen_pulse(amp_max, arr_time, Tpulse; ff = ff_sech)
-    out_array = Matrix{ComplexF32}(undef, length(arr_time), length(amp_max))
+function gen_pulse(amp_max, arr_time, Tpulse; ff = ff_sech, floattype = ComplexF64)
+    out_array = Matrix{floattype}(undef, length(arr_time), length(amp_max))
     for i in 1:length(amp_max)
         if typeof(ff) == Vector{Function}
             func = ff[i]

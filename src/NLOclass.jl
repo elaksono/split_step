@@ -1,36 +1,70 @@
+"""
+NLOclass.jl - Nonlinear Optical Simulation Classes\n
+Updated: 6 March 2025\n
+
+This module provides the essential class definitions and routines for simulating nonlinear optical 
+pulse propagation. It integrates various components including pulse generation, material dispersion, 
+and nonlinear interactions. The module depends on several other modules:
+  - Pulse: For generating various optical pulse shapes.
+  - Constant: For physical constants.
+  - CUDA and FFTW: For GPU and fast Fourier transform operations.
+  - Materials: For material properties and dispersion functions.
+  - Modulation: For modulation-related functions.
+
+Key Components:\n
+
+1. nl_pulse Mutable Structure:
+   - Encapsulates the simulation parameters and state for nonlinear optical pulse propagation.
+   - Fields include:
+     • mat::Material: The material properties (e.g., dispersion coefficients).
+     • pulse::pars_pulse: Pulse parameters such as amplitude, central frequency, and pulse duration.
+     • dz::Real: The fixed propagation step size.
+     • Tmax, dT, arr_time: Parameters defining the time grid (maximum time window, time step, and array of time samples).
+     • init_amp, current_amp, out_amp, temp_amp: Arrays to store the initial, current, and output amplitudes, and temporary storage.
+     • κ_matrix: Matrix for the nonlinear coupling coefficients.
+     • nl_func: Function that defines the nonlinear phase accumulation (typically of the form exp(1im * phi)).
+     • phi_z: Function (or function handle) that specifies the phase evolution along the propagation direction.
+     • Frequency-domain fields (arr_omega, beta_ω, exp_beta_dz, dk_qpm, delta_k) for the simulation of spectral dynamics.
+
+2. nl_pulse Constructor:
+   - The constructor initializes a nl_pulse instance given a Material object and pulse parameters.
+   - Key steps in the constructor:
+     • Determines the maximum time window (Tmax) for the simulation based on the provided pulse durations and an optional scaling factor.
+     • Computes the time step (dT) and constructs the time array (arr_time) by concatenating positive and negative time intervals.
+     • Generates the initial amplitude (init_amp) using the gen_pulse function from the Pulse module.
+     • Accepts several keyword arguments to control simulation aspects such as phase mismatch, frequency resolution (d_omega), and the nonlinear function (nl_func).
+     • Supports options for quasi-phase matching adjustments via parameters like phase_mismatch and delta_k.
+     
+Usage:\n
+   The nl_pulse structure serves as the central data container for simulating nonlinear optical phenomena,
+   where the evolution of the pulse is computed in both time and frequency domains under the influence of 
+   material dispersion and nonlinear effects.\n
+"""
 module NLOclass
 
-using Pulse: gen_pulse
+using Pulse
+using Constant
 using CUDA, FFTW
-export f_taylor, pars_nl, pars_pulse, nl_pulse, nl_pulse_p
+using Materials
+using Modulation
+
+export nl_pulse, nl_pulse_adb
+export nl_pulse_p
+export calculate_exp_beta_dz
+export nl_class
 
 """
-Taylor series: useful for dispersion
+nl_pulse\n
+AN ESSENTIAL CLASS for the simulation
+
 """
-function f_taylor(x, arr_γ)
-    return sum(arr_γ .* [x.^j ./ factorial(j) for j in collect(0:length(arr_γ)-1)])
-end;
-
-mutable struct pars_nl
-    βnl
-    ωnl
-    κnl::Real
-    pars_nl() = new()
-end
-
-mutable struct pars_pulse
-    amp_max
-    T_pulse
-    N_div::Integer
-    f_pulse
-
-    pars_pulse() = new()
-end
-
 mutable struct nl_pulse
-    nl::pars_nl
+    mat::Material
     pulse::pars_pulse
 
+    # Fixed step
+    dz::Real
+    
     # Time bins
     Tmax::Real
     dT::Real
@@ -44,49 +78,247 @@ mutable struct nl_pulse
     
     # Nonlinearity
     κ_matrix
+    nl_func
+    phi_z
     
     # Frequency bins
+    # exp_ω0T
     arr_omega
-    exp_ω0T
     beta_ω
+    exp_beta_dz
+    dk_qpm
+    delta_k
 end
 
-function nl_pulse(nl::pars_nl, pulse::pars_pulse; fac = 10)
-    # Time
-    Tmax = fac * maximum(pulse.T_pulse)
+"""
+nl_pulse(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 10, pulse_ref = 0, 
+        d_omega = 1e-3, calculate_dk = false,
+        zero_beta0 = true, 
+        phase_mismatch = 0.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
+        phi_z_func = phi_z_con, phi_z_pars = ())\n
+\n
+In this version, the phase_mismatch is enforced at the omg_ctr. It is defined w.r.t dK = beta_p - beta_s - beta_i
+    => delta_k = dK * phase_mismatch
+"""
+function nl_pulse(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 10, pulse_ref = 0, 
+        d_omega = 1e-3, calculate_dk = false,
+        zero_beta0 = true, 
+        phase_mismatch = 0.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
+        phi_z_func = phi_z_con, phi_z_pars = ())
+    Tmax = Tm > maximum(pulse.T_pulse) ? Tm : fac * maximum(pulse.T_pulse)
     dT = 2*Tmax / (pulse.N_div)
-    
-    # We want to follow the FFT definition
-    arr_time = collect(0:dT:Tmax-dT/2)
-    append!(arr_time, collect(-Tmax:dT:-dT/2));
+    arr_time = [collect(0:dT:Tmax-dT/2); collect(-Tmax:dT:-dT/2)]
 
     # Amplitude
+    N_pulse = length(pulse.amp_max)
     init_amp = gen_pulse(pulse.amp_max, arr_time, pulse.T_pulse, ff=pulse.f_pulse)
     current_amp = copy(init_amp)
     out_amp = zeros(typeof(init_amp[1,1]), size(init_amp)...)
     temp_amp = zeros(typeof(init_amp[1,1]), size(init_amp)..., 5)    
 
     # Nonlinearity
-    κ_matrix = (nl.κnl) .* ones(size(init_amp)[1])
+    κ_matrix = (mat.kappa) .* ones(size(init_amp)[1])
     
     # Frequency
+    # exp_ω0T = ones(ComplexF32, size(current_amp)...)
     arr_omega = zeros(size(current_amp)...)
-    exp_ω0T = zeros(ComplexF32, size(current_amp)...)
     beta_ω = zeros(size(current_amp)...)
-
-    for i in 1:length(nl.ωnl)
-        arr_omega[:,i] .= fftfreq(length(arr_time)) .* (2*pi/dT)
-        arr_omega[:,i] .= (nl.ωnl[i] .- arr_omega[:,i])
-        exp_ω0T[:,i] .= exp.((1im * nl.ωnl[i]) .* arr_time)
-        beta_ω[:,i] .= f_taylor(arr_omega[:,i], nl.βnl[:,i])
+    exp_beta_dz = zeros(ComplexF64, size(current_amp)...)
+    
+    if calculate_dk
+        if typeof(mat) <: TaylorMaterial
+            dk_qpm = (beta_func(mat, 0.0, 3) - beta_func(mat, 0.0, 1) - beta_func(mat, 0.0, 2))
+        else
+            dk_qpm = (beta_func(mat, pulse.omg_ctr[3]) - beta_func(mat, pulse.omg_ctr[1]) - beta_func(mat, pulse.omg_ctr[2]))
+        end
+    else
+        dk_qpm = nothing
     end
+    
+    
+    if pulse_ref > 0
+        if typeof(mat) <: TaylorMaterial
+            beta_1_ref = (beta_func(mat, d_omega/2, pulse_ref) - beta_func(mat, -d_omega/2, pulse_ref)) / d_omega
+        else
+            beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref]; d_omega = d_omega)
+        end
+    end
+        
+    for i in 1:N_pulse
+        arr_omega[:,i] .= fftfreq(length(arr_time)) .* (2*pi/dT)
+        
+        if typeof(mat) <: TaylorMaterial
+            beta_ω[:,i] .= [beta_func(mat, omg, i) for omg in arr_omega[:,i]]
+            if zero_beta0
+                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, 0.0, i)
+            end
+        else
+            beta_ω[:,i] .= [beta_func(mat, omg + pulse.omg_ctr[i]) for omg in arr_omega[:,i]]
+            if zero_beta0
+                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, pulse.omg_ctr[i])
+            end
+        end
+        
+        
+        if pulse_ref > 0
+            beta_ω[:,i] .= beta_ω[:,i] .- (beta_1_ref .* arr_omega[:,i])
+        end
+        
+        exp_beta_dz[:,i] .= exp.((-1im * dz) .* beta_ω[:,i])
+    end
+    
+    if isnothing(delta_k)
+        delta_k = phase_mismatch * dk_qpm
+    end
+    phi_z = z -> phi_z_func(z, delta_k, phi_z_pars...)
 
-    nl_pulse(nl, pulse, 
+    nl_pulse(mat, pulse, dz,
         Tmax, dT, arr_time,
         init_amp, current_amp, out_amp, temp_amp, 
-        κ_matrix, arr_omega, exp_ω0T, beta_ω)
+        κ_matrix, nl_func, phi_z,
+        arr_omega, beta_ω, exp_beta_dz, dk_qpm, delta_k)
 end;
 
+"""
+nl_pulse_adb\n
+A class for adiabatically poled waveguide simulation
+"""
+mutable struct nl_pulse_adb
+    mat::Material
+    pulse::pars_pulse
+
+    # Fixed step
+    dz::Real
+    
+    # Time bins
+    Tmax::Real
+    dT::Real
+    arr_time::Vector{Real}
+
+    # Amplitudes
+    init_amp
+    current_amp
+    out_amp
+    temp_amp # Cache
+    
+    # Nonlinearity
+    κ_matrix
+    nl_func
+    phi_z
+    g_func
+    
+    # Frequency bins
+    # exp_ω0T
+    arr_omega
+    beta_ω
+    exp_beta_dz
+    dk_qpm
+    delta_k
+end
+
+"""
+nl_pulse_adb(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 10, pulse_ref = 0, 
+        d_omega = 1e-3, calculate_dk = false,
+        zero_beta0 = true, 
+        qpm_lambda = 20.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
+        phi_z_func = phi_z_con, phi_z_pars = ())\n
+\n
+In this version, we assume a quasi-phase matching point for central frequency defined by qpm_lambda\n
+i.e., dK = beta_p - beta_s - beta_i\n
+=> delta_k = dK - 2*pi/qpm_lambda
+"""
+function nl_pulse_adb(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 10, pulse_ref = 0, 
+        d_omega = 1e-3, calculate_dk = false,
+        zero_beta0 = true, 
+        qpm_lambda = 20.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
+        phi_z_func = phi_z_con, phi_z_pars = (), g_func = g_con, g_pars = ())
+    Tmax = Tm > maximum(pulse.T_pulse) ? Tm : fac * maximum(pulse.T_pulse)
+    dT = 2*Tmax / (pulse.N_div)
+    arr_time = [collect(0:dT:Tmax-dT/2); collect(-Tmax:dT:-dT/2)]
+
+    # Amplitude
+    N_pulse = length(pulse.amp_max)
+    init_amp = gen_pulse(pulse.amp_max, arr_time, pulse.T_pulse, ff=pulse.f_pulse)
+    current_amp = copy(init_amp)
+    out_amp = zeros(typeof(init_amp[1,1]), size(init_amp)...)
+    temp_amp = zeros(typeof(init_amp[1,1]), size(init_amp)..., 5)    
+
+    # Nonlinearity
+    κ_matrix = (mat.kappa) .* ones(size(init_amp)[1])
+    
+    # Frequency
+    # exp_ω0T = ones(ComplexF32, size(current_amp)...)
+    arr_omega = zeros(size(current_amp)...)
+    beta_ω = zeros(size(current_amp)...)
+    exp_beta_dz = zeros(ComplexF64, size(current_amp)...)
+    
+    if calculate_dk
+        if typeof(mat) <: TaylorMaterial
+            dk_qpm = (beta_func(mat, 0.0, 3) - beta_func(mat, 0.0, 1) - beta_func(mat, 0.0, 2))
+        else
+            dk_qpm = (beta_func(mat, pulse.omg_ctr[3]) - beta_func(mat, pulse.omg_ctr[1]) - beta_func(mat, pulse.omg_ctr[2]))
+        end
+    else
+        dk_qpm = nothing
+    end
+    
+    
+    if pulse_ref > 0
+        if typeof(mat) <: TaylorMaterial
+            beta_1_ref = (beta_func(mat, d_omega/2, pulse_ref) - beta_func(mat, -d_omega/2, pulse_ref)) / d_omega
+        else
+            beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref]; d_omega = d_omega)
+        end
+    end
+        
+    for i in 1:N_pulse
+        arr_omega[:,i] .= fftfreq(length(arr_time)) .* (2*pi/dT)
+        
+        if typeof(mat) <: TaylorMaterial
+            beta_ω[:,i] .= [beta_func(mat, omg, i) for omg in arr_omega[:,i]]
+            if zero_beta0
+                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, 0.0, i)
+            end
+        else
+            beta_ω[:,i] .= [beta_func(mat, omg + pulse.omg_ctr[i]) for omg in arr_omega[:,i]]
+            if zero_beta0
+                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, pulse.omg_ctr[i])
+            end
+        end
+        
+        
+        if pulse_ref > 0
+            beta_ω[:,i] .= beta_ω[:,i] .- (beta_1_ref .* arr_omega[:,i])
+        end
+        
+        exp_beta_dz[:,i] .= exp.((-1im * dz) .* beta_ω[:,i])
+    end
+    
+    if isnothing(delta_k)
+        delta_k = dk_qpm - (2*pi)/(qpm_lambda * 1e-3)
+    end
+    
+    phi_z = z -> phi_z_func(z, delta_k, phi_z_pars...)
+    g_func = z -> g_func(z, g_pars...)
+
+    nl_pulse_adb(mat, pulse, dz,
+        Tmax, dT, arr_time,
+        init_amp, current_amp, out_amp, temp_amp, 
+        κ_matrix, nl_func, phi_z, g_func,
+        arr_omega, beta_ω, exp_beta_dz, dk_qpm, delta_k)
+end;
+
+nl_class = Union{nl_pulse, nl_pulse_adb}
+
+function calculate_exp_beta_dz(pulse::nl_class, dz)
+    pulse.dz = dz
+    pulse.exp_beta_dz = exp.((-1im * dz) .* pulse.beta_ω) 
+end
+
+"""
+IN-PROGRESS
+"""
+# STRUCT FOR GPU
 mutable struct nl_pulse_p
     nl_vec::Vector{nl_pulse}
     

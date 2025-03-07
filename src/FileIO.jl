@@ -1,8 +1,8 @@
 module FileIO
 
 using JSON, OrderedCollections
-export generate_input_files
 
+export generate_input_files
 function generate_input_files(master_file::String; filedir = "./input/")
     master = JSON.parse(open("$(filedir)$(master_file).json"));
     
@@ -51,6 +51,12 @@ function generate_input_files(master_file::String; filedir = "./input/")
         end
     end
     return filedir, filename, length(parameters)
+end;
+
+export read_ecpo_pars
+function read_ecpo_pars(idx, folder, filename, pars_label)
+    raw_json = JSON.parsefile("$(folder)$(filename)_$(idx).json");
+    return [raw_json[pars] for pars in pars_label]
 end;
 
 end
