@@ -1,0 +1,8 @@
+# Folders
+.ipynb_checkpoints/
+data/
+dispersion/
+envs/
+figures/
+input/
+output/
