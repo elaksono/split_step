@@ -13,14 +13,15 @@ modulation_func = Dict("sin" => fm_sin, "cos" => fm_cos, "sin2" => fm_sin2, "cos
 # Nonlinear coefficient - spatial modulation
 # Poling profile for a nonlinear process
 export phi_z_con, phi_z_lin, phase_z_func
-phi_z_con(z, k0) = k0 * z
-phi_z_lin(z, k0, zc, dk_1) = (dk_1/2) * ((z-zc)^2 - zc^2) + k0 * z
+phi_z_con(z, dk0, dk_qpm) = (dk0 - dk_qpm) * z
+phi_z_lin(z, dk0, dk_qpm, zc, dk_1) = (dk_1/2) * ((z-zc)^2 - zc^2) + (dk0 - dk_qpm) * z
 
 phase_z_func = Dict("con" => phi_z_con, "lin" => phi_z_lin)
 
 # Phase mismatch
-export dk_z_lin
-dk_z_lin(z, k0, zc, dk_1) = dk_1 * (z-zc) + k0
+export dk_z_con, dk_z_lin
+dk_z_con(z, dk0, dk_qpm) = (dk0 - dk_qpm)
+dk_z_lin(z, dk0, dk_qpm, zc, dk_1) = dk_1 * (z-zc) + (dk0 - dk_qpm)
 
 # Tapered gain
 export g_con, g_tanh, taper_func

@@ -101,9 +101,9 @@ In this version, the phase_mismatch is enforced at the omg_ctr. It is defined w.
     => delta_k = dK * phase_mismatch
 """
 function nl_pulse(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 10, pulse_ref = 0, 
-        d_omega = 1e-3, calculate_dk = false,
+        d_omega = 1e-3, match_dk = false,
         zero_beta0 = true, 
-        phase_mismatch = 0.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
+        qpm_lambda = 20.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
         phi_z_func = phi_z_con, phi_z_pars = ())
     Tmax = Tm > maximum(pulse.T_pulse) ? Tm : fac * maximum(pulse.T_pulse)
     dT = 2*Tmax / (pulse.N_div)
@@ -125,20 +125,22 @@ function nl_pulse(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 1
     beta_ω = zeros(size(current_amp)...)
     exp_beta_dz = zeros(ComplexF64, size(current_amp)...)
     
-    if calculate_dk
-        if typeof(mat) <: TaylorMaterial
-            dk_qpm = (beta_func(mat, 0.0, 3) - beta_func(mat, 0.0, 1) - beta_func(mat, 0.0, 2))
-        else
-            dk_qpm = (beta_func(mat, pulse.omg_ctr[3]) - beta_func(mat, pulse.omg_ctr[1]) - beta_func(mat, pulse.omg_ctr[2]))
-        end
+    # Phase mismatch at central wavelength
+    if typeof(mat) <: TaylorMaterial
+        dk_ctr = (beta_func(mat, pulse.omg_ctr[3], 3) - beta_func(mat, pulse.omg_ctr[1], 1) - beta_func(mat, pulse.omg_ctr[2], 2))
     else
-        dk_qpm = nothing
+        dk_ctr = (beta_func(mat, pulse.omg_ctr[3]) - beta_func(mat, pulse.omg_ctr[1]) - beta_func(mat, pulse.omg_ctr[2]))
     end
     
+    if match_dk
+        dk_qpm = dk_ctr
+    else
+        dk_qpm = (2*pi)/(qpm_lambda * 1e-3)
+    end
     
     if pulse_ref > 0
         if typeof(mat) <: TaylorMaterial
-            beta_1_ref = (beta_func(mat, d_omega/2, pulse_ref) - beta_func(mat, -d_omega/2, pulse_ref)) / d_omega
+            beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref], pulse_ref; d_omega = d_omega)
         else
             beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref]; d_omega = d_omega)
         end
@@ -148,9 +150,9 @@ function nl_pulse(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 1
         arr_omega[:,i] .= fftfreq(length(arr_time)) .* (2*pi/dT)
         
         if typeof(mat) <: TaylorMaterial
-            beta_ω[:,i] .= [beta_func(mat, omg, i) for omg in arr_omega[:,i]]
+            beta_ω[:,i] .= [beta_func(mat, omg + pulse.omg_ctr[i], i) for omg in arr_omega[:,i]]
             if zero_beta0
-                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, 0.0, i)
+                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, pulse.omg_ctr[i], i)
             end
         else
             beta_ω[:,i] .= [beta_func(mat, omg + pulse.omg_ctr[i]) for omg in arr_omega[:,i]]
@@ -158,7 +160,6 @@ function nl_pulse(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 1
                 beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, pulse.omg_ctr[i])
             end
         end
-        
         
         if pulse_ref > 0
             beta_ω[:,i] .= beta_ω[:,i] .- (beta_1_ref .* arr_omega[:,i])
@@ -168,10 +169,13 @@ function nl_pulse(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 1
     end
     
     if isnothing(delta_k)
-        delta_k = phase_mismatch * dk_qpm
+        # delta_k based on central frequency and poling period
+        phi_z = z -> phi_z_func(z, dk_ctr, dk_qpm, phi_z_pars...)
+    else
+        # Externally determined delta_k
+        phi_z = z -> phi_z_func(z, delta_k, 0, phi_z_pars...)
     end
-    phi_z = z -> phi_z_func(z, delta_k, phi_z_pars...)
-
+    
     nl_pulse(mat, pulse, dz,
         Tmax, dT, arr_time,
         init_amp, current_amp, out_amp, temp_amp, 
@@ -204,21 +208,27 @@ mutable struct nl_pulse_adb
     # Nonlinearity
     κ_matrix
     nl_func
+    phi_z_func
+    phi_z_pars
     phi_z
     g_func
+    g_pars
+    g_z
     
     # Frequency bins
-    # exp_ω0T
     arr_omega
     beta_ω
     exp_beta_dz
+    
+    # QPM
+    dk_ctr
     dk_qpm
     delta_k
 end
 
 """
 nl_pulse_adb(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 10, pulse_ref = 0, 
-        d_omega = 1e-3, calculate_dk = false,
+        d_omega = 1e-3, match_dk = false,
         zero_beta0 = true, 
         qpm_lambda = 20.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
         phi_z_func = phi_z_con, phi_z_pars = ())\n
@@ -228,7 +238,7 @@ i.e., dK = beta_p - beta_s - beta_i\n
 => delta_k = dK - 2*pi/qpm_lambda
 """
 function nl_pulse_adb(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac = 10, pulse_ref = 0, 
-        d_omega = 1e-3, calculate_dk = false,
+        d_omega = 1e-3, match_dk = false,
         zero_beta0 = true, 
         qpm_lambda = 20.0, delta_k = nothing, nl_func = phi -> exp(1im * phi), 
         phi_z_func = phi_z_con, phi_z_pars = (), g_func = g_con, g_pars = ())
@@ -252,20 +262,22 @@ function nl_pulse_adb(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac
     beta_ω = zeros(size(current_amp)...)
     exp_beta_dz = zeros(ComplexF64, size(current_amp)...)
     
-    if calculate_dk
-        if typeof(mat) <: TaylorMaterial
-            dk_qpm = (beta_func(mat, 0.0, 3) - beta_func(mat, 0.0, 1) - beta_func(mat, 0.0, 2))
-        else
-            dk_qpm = (beta_func(mat, pulse.omg_ctr[3]) - beta_func(mat, pulse.omg_ctr[1]) - beta_func(mat, pulse.omg_ctr[2]))
-        end
+    # Calculate for the central wavelength
+    if typeof(mat) <: TaylorMaterial
+        dk_ctr = (beta_func(mat, pulse.omg_ctr[3], 3) - beta_func(mat, pulse.omg_ctr[1], 1) - beta_func(mat, pulse.omg_ctr[2], 2))
     else
-        dk_qpm = nothing
+        dk_ctr = (beta_func(mat, pulse.omg_ctr[3]) - beta_func(mat, pulse.omg_ctr[1]) - beta_func(mat, pulse.omg_ctr[2]))
     end
     
+    if match_dk
+        dk_qpm = dk_ctr
+    else
+        dk_qpm = (2*pi)/(qpm_lambda * 1e-3)
+    end  
     
     if pulse_ref > 0
         if typeof(mat) <: TaylorMaterial
-            beta_1_ref = (beta_func(mat, d_omega/2, pulse_ref) - beta_func(mat, -d_omega/2, pulse_ref)) / d_omega
+            beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref], pulse_ref; d_omega = d_omega)
         else
             beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref]; d_omega = d_omega)
         end
@@ -275,17 +287,16 @@ function nl_pulse_adb(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac
         arr_omega[:,i] .= fftfreq(length(arr_time)) .* (2*pi/dT)
         
         if typeof(mat) <: TaylorMaterial
-            beta_ω[:,i] .= [beta_func(mat, omg, i) for omg in arr_omega[:,i]]
+            beta_ω[:,i] .= [beta_func(mat, pulse.omg_ctr[i] + omg, i) for omg in arr_omega[:,i]]
             if zero_beta0
-                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, 0.0, i)
+                beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, pulse.omg_ctr[i], i)
             end
         else
-            beta_ω[:,i] .= [beta_func(mat, omg + pulse.omg_ctr[i]) for omg in arr_omega[:,i]]
+            beta_ω[:,i] .= [beta_func(mat, pulse.omg_ctr[i] + omg) for omg in arr_omega[:,i]]
             if zero_beta0
                 beta_ω[:,i] .= beta_ω[:,i] .- beta_func(mat, pulse.omg_ctr[i])
             end
         end
-        
         
         if pulse_ref > 0
             beta_ω[:,i] .= beta_ω[:,i] .- (beta_1_ref .* arr_omega[:,i])
@@ -295,17 +306,24 @@ function nl_pulse_adb(mat::Material, pulse::pars_pulse; dz = 1e-2, Tm = 0.0, fac
     end
     
     if isnothing(delta_k)
-        delta_k = dk_qpm - (2*pi)/(qpm_lambda * 1e-3)
+        # delta_k based on central frequency and poling period
+        phi_z = z -> phi_z_func(z, dk_ctr, dk_qpm, phi_z_pars...)
+        delta_k = dk_ctr - dk_qpm
+    else
+        # Externally determined delta_k
+        phi_z = z -> phi_z_func(z, delta_k, 0, phi_z_pars...)
     end
     
-    phi_z = z -> phi_z_func(z, delta_k, phi_z_pars...)
-    g_func = z -> g_func(z, g_pars...)
+    g_z = z -> g_func(z, g_pars...)
 
     nl_pulse_adb(mat, pulse, dz,
         Tmax, dT, arr_time,
         init_amp, current_amp, out_amp, temp_amp, 
-        κ_matrix, nl_func, phi_z, g_func,
-        arr_omega, beta_ω, exp_beta_dz, dk_qpm, delta_k)
+        κ_matrix, nl_func, 
+        phi_z_func, phi_z_pars, phi_z, 
+        g_func, g_pars, g_z,
+        arr_omega, beta_ω, exp_beta_dz, 
+        dk_ctr, dk_qpm, delta_k)
 end;
 
 nl_class = Union{nl_pulse, nl_pulse_adb}

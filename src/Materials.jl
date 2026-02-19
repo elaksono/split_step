@@ -30,7 +30,7 @@ using NPZ
 
 export Material, ConstantMaterial, TaylorMaterial, SellmeierMaterial, SellmeierMaterial_2, RationalMaterial, LaurentMaterial
 export beta_taylor, beta_sellmeier, beta_rational, beta_laurent
-export beta_func, beta_1_func, beta_2_func, beta_3_func, beta_4_func, n_func
+export beta_func, beta_1_func, beta_2_func, beta_3_func, beta_4_func, n_func, gv_func, gvm_func
 export convert_to_TaylorMaterial
 
 
@@ -42,7 +42,7 @@ function beta_taylor(omega::Float64, beta_arr)
 end;
 
 """
-Fu=ll dispersion in Sellmeier form
+Full dispersion in Sellmeier form
 """
 function beta_sellmeier(omega::Float64, Avec::Vector{Float64}, Bvec::Vector{Float64})
     k0 = (omega * 1e12/ c0) * 1e-6
@@ -177,7 +177,7 @@ mutable struct TaylorMaterial <: Material
 end
 
 function beta_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer)
-    return beta_taylor(omega, mat.beta_array[:,id_wave])
+    return beta_taylor(omega - mat.omega_c[id_wave], mat.beta_array[:,id_wave])
 end
 
 
@@ -349,45 +349,133 @@ function beta_func(mat::LaurentMaterial, omega::Float64)
 end
 
 """
-n_func(mat::Material, omega)
-Refractive index
+check_TaylorMaterial(mat::Material)
+"""
+function check_TaylorMaterial(mat::Material)
+    if typeof(mat) <: TaylorMaterial
+        throw(TypeError(:mat, "Taylor Material, an additional argument id_wave is required", Material, TaylorMaterial))
+    end
+end
+
+"""
+n_func(mat::Material, omega::Float64)
+n_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer)
+    Refractive index
 """
 function n_func(mat::Material, omega::Float64)
+    check_TaylorMaterial(mat)
     k0 = (omega * 1e12) / (c0 * 1e3)
     return beta_func(mat, omega) / k0
 end
 
+function n_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer)
+    k0 = (omega * 1e12) / (c0 * 1e3)
+    return beta_func(mat, omega, id_wave) / k0
+end
+
+
+# function beta_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer)
+#     return beta_taylor(omega, mat.beta_array[:,id_wave])
+# end
+
 """
-beta_1_func(mat::Material, omega; d_omega = 1e-3)
+beta_1_func(mat::Material, omega::Float64; d_omega = 1e-3)
+beta_1_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    Calculating the first-order derivative of beta_function (related to GV)
 """
 function beta_1_func(mat::Material, omega::Float64; d_omega = 1e-3)
+    check_TaylorMaterial(mat)
     beta_1 = (beta_func(mat, omega + d_omega/2) - beta_func(mat, omega - d_omega/2))/(d_omega)
     return beta_1
 end
 
+function beta_1_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    beta_1 = (beta_func(mat, omega + d_omega/2, id_wave) - beta_func(mat, omega - d_omega/2, id_wave))/(d_omega)
+    return beta_1
+end
+
+"""
+gv_func(mat::Material, omega::Float64; d_omega = 1e-3)
+gv_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    Calculating Group Velocity for a particular wavelength
+"""
+function gv_func(mat::Material, omega::Float64; d_omega = 1e-3)
+    check_TaylorMaterial(mat)
+    beta_1 = beta_1_func(mat, omega; d_omega)
+    return 1/beta_1
+end
+
+function gv_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    beta_1 = beta_1_func(mat, omega, id_wave; d_omega)
+    return 1/beta_1
+end
+
+"""
+gvm_func(mat::TaylorMaterial, omega_vec::Vector{Float64}; d_omega = 1e-3)
+gvm_func(mat::TaylorMaterial, omega_vec::Vector{Float64}, id_vec::Vector{Integer}; d_omega = 1e-3)
+    Calculating Group Velocity Mismatch between two wavelengths
+    The mode index should be specified for Taylor Materials
+"""
+function gvm_func(mat::Material, omega_vec::Vector{Float64}; d_omega = 1e-3)
+    check_TaylorMaterial(mat)
+    beta_1a = beta_1_func(mat, omega_vec[1]; d_omega)
+    beta_1b = beta_1_func(mat, omega_vec[2]; d_omega)
+    return 1/(beta_1a - beta_1b)
+end
+
+function gvm_func(mat::TaylorMaterial, omega_vec::Vector{Float64}, id_vec::Vector{Int64}; d_omega = 1e-3)
+    beta_1a = beta_1_func(mat, omega_vec[1], id_vec[1]; d_omega)
+    beta_1b = beta_1_func(mat, omega_vec[2], id_vec[2]; d_omega)
+    return 1/(beta_1a - beta_1b)
+end
+
 """
 beta_2_func(mat::Material, omega; d_omega = 1e-3)
+beta_2_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    Second order dispersion
 """
 function beta_2_func(mat::Material, omega::Float64; d_omega = 1e-3)
+    check_TaylorMaterial(mat)
     beta_2 = (beta_func(mat, omega + d_omega) + beta_func(mat, omega - d_omega) - 2 * beta_func(mat, omega))/(d_omega^2)
+    return beta_2
+end
+
+function beta_2_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    beta_2 = (beta_func(mat, omega + d_omega, id_wave) + beta_func(mat, omega - d_omega, id_wave) - 2 * beta_func(mat, omega, id_wave))/(d_omega^2)
     return beta_2
 end
 
 """
 beta_3_func(mat::Material, omega; d_omega = 1e-3)
+beta_3_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    Third order dispersion
 """
 function beta_3_func(mat::Material, omega::Float64; d_omega = 1e-3)
+    check_TaylorMaterial(mat)
     beta_3 = (beta_func(mat, omega + 2 * d_omega) - 2 * beta_func(mat, omega + d_omega) + 
         2 * beta_func(mat, omega - d_omega) - beta_func(mat, omega - 2 * d_omega))/(2 * d_omega^3)
     return beta_3
 end
 
+function beta_3_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    beta_3 = (beta_func(mat, omega + 2 * d_omega, id_wave) - 2 * beta_func(mat, omega + d_omega, id_wave) + 
+        2 * beta_func(mat, omega - d_omega, id_wave) - beta_func(mat, omega - 2 * d_omega, id_wave))/(2 * d_omega^3)
+    return beta_3
+end
+
 """
 beta_4_func(mat::Material, omega; d_omega = 1e-3)
+beta_4_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    Fourth order dispersion
 """
 function beta_4_func(mat::Material, omega::Float64; d_omega = 1e-3)
     beta_4 = (beta_func(mat, omega + 2 * d_omega) - 4 * beta_func(mat, omega + d_omega) + 6 * beta_func(mat, omega) - 
         4 * beta_func(mat, omega - d_omega) + beta_func(mat, omega - 2 * d_omega))/(d_omega^4)
+    return beta_4
+end
+
+function beta_4_func(mat::TaylorMaterial, omega::Float64, id_wave::Integer; d_omega = 1e-3)
+    beta_4 = (beta_func(mat, omega + 2 * d_omega, id_wave) - 4 * beta_func(mat, omega + d_omega, id_wave) + 6 * beta_func(mat, omega, id_wave) - 4 * beta_func(mat, omega - d_omega, id_wave) + beta_func(mat, omega - 2 * d_omega, id_wave))/(d_omega^4)
     return beta_4
 end
 

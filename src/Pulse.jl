@@ -82,13 +82,17 @@ function pulse_disp(T, z, A, σ, β0, β1, β2)
 end;
 
 """
-pulse_disp(T, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer)
+pulse_disp(T, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0, zero_beta0 = true)
 pulse under second order dispersion
 """
-function pulse_disp(T, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0)
+function pulse_disp(T, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0, zero_beta0 = true)
     A = pulse.amp_max[id_pulse]
     σ = pulse.T_pulse[id_pulse]
     β0 = mat.beta_array[1,id_pulse]
+    if zero_beta0
+        β0 = 0
+    end 
+        
     if pulse_ref == 0
         β1 = mat.beta_array[2,id_pulse]
     else
@@ -103,17 +107,22 @@ end;
 
 """
 pulse_disp_FT(ω, z, A, σ, β0, β1, β2)
-pulse Fourier component under second order dispersion
+pulse_disp_FT(ω, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0, zero_beta0 = true)
+    pulse Fourier component under second order dispersion
 """
 function pulse_disp_FT(ω, z, A, σ, β0, β1, β2)
     out = A/sqrt(2*pi) * exp(-1im*z*(β0 + β1*ω + 0.5*β2*ω^2)) * exp(-(σ*ω)^2/2)
     return out
 end;
 
-function pulse_disp_FT(ω, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0)
+function pulse_disp_FT(ω, z, pulse::pars_pulse, mat::TaylorMaterial, id_pulse::Integer; pulse_ref = 0, zero_beta0 = true)
     A = pulse.amp_max[id_pulse]
     σ = pulse.T_pulse[id_pulse]
     β0 = mat.beta_array[1,id_pulse]
+    if zero_beta0
+        β0 = 0
+    end
+    
     if pulse_ref == 0
         β1 = mat.beta_array[2,id_pulse]
     else
@@ -129,16 +138,30 @@ end;
 pulse_disp_FT_fd(ω, z, A, σ,  ωctr::Float64, Avec::Vector{Float64}, Bvec::Vector{Float64}; beta_f = beta_sellmeier)
 pulse Fourier component under full dispersion
 """
-function pulse_disp_FT_fd(ω, z, pulse::pars_pulse, mat::Material, id_pulse::Integer; pulse_ref = 0)
+function pulse_disp_FT_fd(ω, z, pulse::pars_pulse, mat::Material, id_pulse::Integer; pulse_ref = 0, zero_beta0 = true)
+    beta_c = 0
+    beta_1_ref = 0
     A = pulse.amp_max[id_pulse]
     σ = pulse.T_pulse[id_pulse]
     ωctr = pulse.omg_ctr[id_pulse]
-    if pulse_ref == 0
-        beta = beta_func(mat, ω + ωctr)
-    else
-        beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref])
-        beta = beta_func(mat, ω + ωctr) - beta_1_ref * ω 
-    end        
+    
+    if zero_beta0
+        if typeof(mat) <: TaylorMaterial
+            beta_c = beta_func(mat, pulse.omg_ctr[id_pulse], id_pulse)
+        else
+            beta_c = beta_func(mat, pulse.omg_ctr[id_pulse])
+        end
+    end
+    
+    if pulse_ref > 0
+        if typeof(mat) <: TaylorMaterial
+            beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref], pulse_ref)
+        else
+            beta_1_ref = beta_1_func(mat, pulse.omg_ctr[pulse_ref])
+        end
+    end
+    
+    beta = beta_func(mat, ω + ωctr) - beta_c - beta_1_ref * ω        
     out = A/sqrt(2*pi) * exp(-1im*z*beta) * exp(-(σ*ω)^2/2)
     return out
 end;
