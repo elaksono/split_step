@@ -6,3 +6,8 @@ envs/
 figures/
 input/
 output/
+Plots/
+CSV_Data/
+Sellmeier/
+src/__pycache__/
+src/qpm.py
